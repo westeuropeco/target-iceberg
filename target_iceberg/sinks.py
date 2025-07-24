@@ -7,7 +7,13 @@ from decimal import Decimal
 from singer_sdk.sinks import BatchSink
 import pyarrow as pa  # type: ignore
 from pyiceberg.catalog import load_catalog
-from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchNamespaceError, NoSuchTableError
+from pyiceberg.exceptions import (
+    NamespaceAlreadyExistsError,
+    NoSuchNamespaceError,
+    NoSuchTableError,
+    ValidationError,
+    CommitFailedException,
+)
 from pyiceberg.types import StringType
 from pyarrow import fs
 
@@ -25,6 +31,22 @@ def coerce_decimals(obj):
     else:
         return obj
 
+
+def _align_arrow_to_iceberg(
+    arrow_tbl: pa.Table,
+    iceberg_sch: Schema,         # pyiceberg.schema.Schema
+) -> pa.Table:
+    """Return *arrow_tbl* reordered & padded to exactly match iceberg_sch."""
+    names = [f.name for f in iceberg_sch.fields]
+    cols  = {}
+    for n in names:
+        if n in arrow_tbl.column_names:
+            cols[n] = arrow_tbl[n]
+        else:
+            # create a null column of the right Arrow type
+            pa_type = iceberg_sch.find_field(n).type.to_arrow()
+            cols[n] = pa.scalar(None, type=pa_type).repeat(len(arrow_tbl))
+    return pa.Table.from_pydict(cols)
 
 
 class IcebergSink(BatchSink):
@@ -57,7 +79,65 @@ class IcebergSink(BatchSink):
         self.stream_name = stream_name
         self.schema = schema
 
+
     def process_batch(self, context: dict) -> None:
+        if not context["records"]:
+            return                                               # nothing to do ✔︎
+
+        # 1. ----- catalogue ----------------------------------------------------
+        catalog = load_catalog(
+            self.config["iceberg_catalog_name"],
+            uri=self.config["iceberg_rest_uri"],
+            **{
+                "s3.endpoint": self.config["s3_endpoint"],
+                "s3.region": fs.resolve_s3_region(self.config["s3_bucket"]),
+                "s3.access-key-id": self.config["aws_access_key_id"],
+                "s3.secret-access-key": self.config["aws_secret_access_key"],
+                "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
+            },
+        )
+
+        ns = self.config["iceberg_catalog_namespace_name"]
+        try:
+            catalog.create_namespace(ns)
+        except (NamespaceAlreadyExistsError, NoSuchNamespaceError):
+            pass
+
+        # 2. ----- build Arrow table -------------------------------------------
+        pa_schema  = singer_to_pyarrow_schema(self, self.schema)
+        arrow_tbl  = pa.Table.from_pylist(
+            [coerce_decimals(r) for r in context["records"]],
+            schema=pa_schema,
+        )
+
+        # 3. ----- load / create Iceberg table ----------------------------------
+        table_id = f"{ns}.{self.stream_name}"
+        try:
+            table = catalog.load_table(table_id)
+            table_exists = True
+        except NoSuchTableError:
+            table_exists = False
+            iceberg_schema = pyarrow_to_pyiceberg_schema(self, pa_schema)
+            table = catalog.create_table(table_id, schema=iceberg_schema)
+
+        # 4. ----- (optional) evolve schema first -------------------------------
+        if table_exists:
+            with table.update_schema() as upd:
+                upd.union_by_name(arrow_tbl.schema)  # no‑op if nothing new
+            table = catalog.load_table(table_id)     # reload snapshot
+
+        # 5. ----- align & write -------------------------------------------------
+        aligned_tbl = _align_arrow_to_iceberg(arrow_tbl, table.schema())
+        try:
+            table.append(aligned_tbl)
+        except ValidationError as e:
+            self.logger.error("Schema validation failed: %s", e)
+            raise
+        except CommitFailedException as e:
+            self.logger.error("Iceberg commit failed: %s", e)
+            raise
+
+    def process_batch_old(self, context: dict) -> None:
         """Write out any prepped records and return once fully written.
 
         Args:
@@ -134,6 +214,10 @@ class IcebergSink(BatchSink):
                 with table.update_schema() as update_schema:
                     update_schema.union_by_name(df.schema)
                 self.logger.info(f"Schema evolved for table '{table_id}'")
+                
+                # Reload the table to get the updated schema
+                table = catalog.load_table(table_id)
+                self.logger.info(f"Reloaded table '{table_id}' with evolved schema")
                 
                 # Retry append with evolved schema
                 table.append(df)
